@@ -28,13 +28,16 @@ app.add_middleware(
 # ==========================================
 print("Loading TFLite model...")
 try:
-    interpreter = tf.lite.Interpreter(model_path="baby_sound_classifier_v2.tflite")
+    interpreter = tf.lite.Interpreter(model_path="baby_sound_classifier.tflite")
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     print("✅ Model loaded successfully!")
 except Exception as e:
     print(f"❌ Failed to load model. Error: {e}")
+
+# Define classification categories mapping to the model's output neurons
+CATEGORIES = ['baby_cry', 'baby_laugh', 'noise', 'silence']
 
 
 # ==========================================
@@ -94,40 +97,57 @@ async def predict_media(file: UploadFile = File(...)):
 
         audio.export(temp_wav_path, format="wav")
 
-        # 4. Load the pure .wav file into librosa
-        y, sr = librosa.load(temp_wav_path, sr=22050)
+        # 4. Load the pure .wav file into librosa (Match training: 22050Hz, 5 seconds)
+        y, sr = librosa.load(temp_wav_path, sr=22050, duration=5)
 
-        # 5. Generate the Mel Spectrogram
-        melspec = librosa.feature.melspectrogram(
-            y=y, sr=sr, n_mels=40, n_fft=2048, hop_length=512
-        )
-
-        # 6. Convert to DB and Normalize
-        log_melspec = librosa.power_to_db(melspec, ref=np.max)
-        log_melspec = (log_melspec - np.min(log_melspec)) / (np.max(log_melspec) - np.min(log_melspec) + 1e-10)
-
-        # 7. Pad or truncate to exactly 216 frames
-        if log_melspec.shape[1] < 216:
-            pad_width = 216 - log_melspec.shape[1]
-            log_melspec = np.pad(log_melspec, pad_width=((0, 0), (0, pad_width)), mode='constant')
+        # 5. Pad or truncate raw audio to exactly 5 seconds
+        target_length = 22050 * 5
+        if len(y) < target_length:
+            y = np.pad(y, (0, target_length - len(y)))
         else:
-            log_melspec = log_melspec[:, :216]
+            y = y[:target_length]
 
-        # 8. Reshape and predict
-        real_input = log_melspec.reshape(1, 40, 216, 1).astype(np.float32)
+        # 6. Extract MFCC (instead of Mel Spectrogram)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+
+        # 7. Shape fixing (Ensure width matches 216)
+        expected_width = 216
+        if mfcc.shape[1] < expected_width:
+            mfcc = np.pad(mfcc, ((0, 0), (0, expected_width - mfcc.shape[1])))
+        else:
+            mfcc = mfcc[:, :expected_width]
+
+        # 8. Reshape for TFLite model [1, 40, 216, 1]
+        mfcc = mfcc.astype(np.float32)
+        real_input = np.expand_dims(np.expand_dims(mfcc, axis=0), axis=-1)
+
+        # 9. Run Inference
         interpreter.set_tensor(input_details[0]['index'], real_input)
         interpreter.invoke()
+        output_data = interpreter.get_tensor(output_details[0]['index'])
 
-        prediction = interpreter.get_tensor(output_details[0]['index'])
-        cry_probability = float(prediction[0][0])
-        print(f"Analyzed {file.filename} -> Cry Probability: {cry_probability:.2f}")
+        # 10. Process Multi-class Output
+        predicted_index = int(np.argmax(output_data))
+        top_result = CATEGORIES[predicted_index]
+        top_confidence = float(output_data[0][predicted_index] * 100)
+
+        # Keep backwards compatibility with React frontend tracking "cry probability" directly
+        cry_probability = float(output_data[0][0])  # Index 0 is 'baby_cry'
+
+        print(f"Analyzed {file.filename} -> {top_result} ({top_confidence:.2f}%)")
 
         return {
             "success": True,
             "filename": file.filename,
             "ai_analysis": {
+                # Frontend relies on these two fields to plot graphs and trigger alerts
                 "cry_probability": cry_probability,
-                "is_crying": cry_probability > 0.85
+                "is_crying": top_result == 'baby_cry',
+
+                # Extra detailed information for potential future use
+                "top_prediction": top_result,
+                "confidence": top_confidence,
+                "all_scores": {cat: float(output_data[0][i]) for i, cat in enumerate(CATEGORIES)}
             }
         }
     except Exception as e:
