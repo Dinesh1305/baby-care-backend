@@ -1,173 +1,212 @@
-import os
-import tempfile
-import traceback
-import librosa
 import numpy as np
-import tensorflow as tf
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import librosa
+import pyaudio
+import threading
+import cv2
+import os
+import time
 import uvicorn
+import pygame
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-# Import pydub for the audio conversion workaround
-from pydub import AudioSegment
+# --- Global State ---
+# This keeps the latest results accessible to the FastAPI endpoint
+latest_detection = {
+    "label": "Initializing...",
+    "confidence": 0.0,
+    "is_crying": False,
+    "status": "Listening",
+    "time_until_music": 0.0  # Added field for the countdown
+}
 
-app = FastAPI(title="Baby Monitor AI Backend")
+# --- Import Logic for TFLite ---
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    try:
+        import tensorflow.lite as tflite
+    except ImportError:
+        tflite = None
+        print("❌ Error: TFLite not found. Run: pip install tensorflow")
 
-# Configure CORS for React
+# --- Model Loading ---
+MODEL_PATH = "baby_cry_v2_pro.tflite"
+interpreter = None
+input_details = None
+output_details = None
+
+if tflite and os.path.exists(MODEL_PATH):
+    try:
+        interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
+
+# --- Audio Config ---
+RATE = 22050
+CHUNK = 1024
+DURATION = 4  # Analyze 5-second sliding windows
+
+# --- Music Config ---
+pygame.mixer.init()
+SONG_PATH = "song.mp3"
+CRY_TIME_THRESHOLD = 4.0  # Seconds of continuous crying required to play music
+
+# Pre-load song if it exists
+if os.path.exists(SONG_PATH):
+    pygame.mixer.music.load(SONG_PATH)
+else:
+    print(f"⚠️ Warning: {SONG_PATH} not found. Music will not play.")
+
+
+def process_audio(audio_data):
+    """Processes audio buffer and returns AI prediction"""
+    try:
+        if interpreter is None:
+            return "Model Error", 0
+
+        # 1. Normalize and fix length
+        audio_data = librosa.util.fix_length(audio_data, size=RATE * DURATION)
+        if np.max(np.abs(audio_data)) > 0:
+            audio_data = librosa.util.normalize(audio_data)
+
+        # 2. Silence check (RMS)
+        if np.sqrt(np.mean(audio_data ** 2)) < 0.01:
+            return "Silence", 0.0
+
+        # 3. Create Spectrogram (128x128)
+        spec = librosa.feature.melspectrogram(y=audio_data, sr=RATE, n_mels=128)
+        log_spec = librosa.power_to_db(spec, ref=np.max)
+        resized = cv2.resize(log_spec, (128, 128))
+
+        # 4. Prepare for Model (Batch, Height, Width, Channels)
+        inp = np.expand_dims(resized, axis=(0, -1)).astype(np.float32)
+
+        # 5. Inference
+        interpreter.set_tensor(input_details[0]['index'], inp)
+        interpreter.invoke()
+        conf = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+
+        # Thresholding
+        label = "Baby Crying" if conf > 0.65 else "Normal"
+        confidence_score = conf * 100 if label == "Baby Crying" else (1 - conf) * 100
+        return label, confidence_score
+
+    except Exception as e:
+        print(f"⚠️ Inference Error: {e}")
+        return "Error", 0
+
+
+def mic_loop():
+    """Background thread: Keeps the microphone ON and processes sound"""
+    global latest_detection
+    p = pyaudio.PyAudio()
+
+    # Track when the crying started
+    crying_start_time = None
+
+    try:
+        stream = p.open(format=pyaudio.paFloat32, channels=1, rate=RATE,
+                        input=True, frames_per_buffer=CHUNK)
+
+        # Rolling buffer to hold 5 seconds of audio
+        buffer = np.zeros(RATE * DURATION, dtype=np.float32)
+
+        print("\n" + "=" * 40)
+        print("🎙️  MIC ACTIVE: Monitoring Real-Time...")
+        print("=" * 40 + "\n")
+
+        while True:
+            # Read small chunks to keep it responsive
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            new_samples = np.frombuffer(data, dtype=np.float32)
+
+            # Slide the buffer
+            buffer = np.roll(buffer, -len(new_samples))
+            buffer[-len(new_samples):] = new_samples
+
+            # Process AI prediction
+            label, conf = process_audio(buffer)
+            is_crying = (label == "Baby Crying")
+
+            time_until_music = 0.0
+
+            # --- TIMER AND MUSIC LOGIC ---
+            if is_crying:
+                if crying_start_time is None:
+                    # Start the timer
+                    crying_start_time = time.time()
+                    time_until_music = float(CRY_TIME_THRESHOLD)
+                else:
+                    # Calculate elapsed and remaining time
+                    elapsed_crying_time = time.time() - crying_start_time
+                    time_until_music = max(0.0, CRY_TIME_THRESHOLD - elapsed_crying_time)
+
+                    if elapsed_crying_time > CRY_TIME_THRESHOLD:
+                        # If crying > 10s and music isn't already playing, play music
+                        if not pygame.mixer.music.get_busy() and os.path.exists(SONG_PATH):
+                            print(f"\n🎶 Baby has been crying for {CRY_TIME_THRESHOLD}s. Playing lullaby...")
+                            pygame.mixer.music.play()
+            else:
+                # If baby stops crying, reset the timer
+                crying_start_time = None
+                time_until_music = 0.0
+
+            # Update global state (Frontend can access time_until_music here)
+            latest_detection = {
+                "label": label,
+                "confidence": round(conf, 2),
+                "is_crying": is_crying,
+                "status": "Monitoring",
+                "time_until_music": round(time_until_music, 1)
+            }
+
+            # Print Alert & Countdown to Terminal
+            if is_crying:
+                if pygame.mixer.music.get_busy():
+                    print(f"🚨 ALERT: Baby Crying! ({conf:.1f}%) - 🎶 Lullaby is currently playing.")
+                else:
+                    print(f"🚨 ALERT: Baby Crying! ({conf:.1f}%) - ⏳ Lullaby in {time_until_music:.1f}s")
+
+    except Exception as e:
+        print(f"❌ Microphone Error: {e}")
+    finally:
+        p.terminate()
+
+
+# --- FastAPI Backend ---
+app = FastAPI(title="Baby Monitor AI - Real Time")
+
+# Enable CORS for React/Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
+
     allow_headers=["*"],
 )
 
-# ==========================================
-# 1. LOAD THE AI MODEL ON STARTUP
-# ==========================================
-print("Loading TFLite model...")
-try:
-    interpreter = tf.lite.Interpreter(model_path="baby_sound_classifier.tflite")
-    interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    print("✅ Model loaded successfully!")
-except Exception as e:
-    print(f"❌ Failed to load model. Error: {e}")
 
-# Define classification categories mapping to the model's output neurons
-CATEGORIES = ['baby_cry', 'baby_laugh', 'noise', 'silence']
-
-
-# ==========================================
-# 2. DEFINE DATA STRUCTURES
-# ==========================================
-class SoundData(BaseModel):
-    intensity: int
-    status: str
-    duration: int = 0
+@app.get("/status")
+async def get_status():
+    """Endpoint for frontend to poll real-time status"""
+    response_data = latest_detection.copy()
+    response_data["music_playing"] = pygame.mixer.music.get_busy()
+    return response_data
 
 
 @app.get("/")
-def health_check():
-    return {"status": "API is live and ready", "model_loaded": "interpreter" in globals()}
-
-
-# ==========================================
-# 3. ENDPOINT: IoT SENSORS (ESP32/Arduino)
-# ==========================================
-@app.post("/sound-detected")
-async def process_sound_data(data: SoundData):
-    try:
-        is_crying = data.intensity > 70
-        print(f"Received IoT Data - Intensity: {data.intensity}, Status: {data.status}")
-        return {
-            "success": True,
-            "received_intensity": data.intensity,
-            "action": "Triggering React alerts" if is_crying else "Normal"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ==========================================
-# 4. ENDPOINT: RAW AUDIO FOR AI PREDICTION
-# ==========================================
-@app.post("/predict-media")
-async def predict_media(file: UploadFile = File(...)):
-    temp_webm_path = ""
-    temp_wav_path = ""
-    try:
-        # 1. Grab the actual extension from the file (e.g., '.webm' or '.wav')
-        ext = os.path.splitext(file.filename)[1]
-        if not ext:
-            ext = ".webm"  # Default to webm if missing
-
-        # 2. Save the incoming file (.webm from React)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_webm:
-            temp_webm.write(await file.read())
-            temp_webm_path = temp_webm.name
-
-        # 3. Convert .webm to .wav using pydub
-        audio = AudioSegment.from_file(temp_webm_path)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
-            temp_wav_path = temp_wav.name
-
-        audio.export(temp_wav_path, format="wav")
-
-        # 4. Load the pure .wav file into librosa (Match training: 22050Hz, 5 seconds)
-        y, sr = librosa.load(temp_wav_path, sr=22050, duration=5)
-
-        # 5. Pad or truncate raw audio to exactly 5 seconds
-        target_length = 22050 * 5
-        if len(y) < target_length:
-            y = np.pad(y, (0, target_length - len(y)))
-        else:
-            y = y[:target_length]
-
-        # 6. Extract MFCC (instead of Mel Spectrogram)
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
-
-        # 7. Shape fixing (Ensure width matches 216)
-        expected_width = 216
-        if mfcc.shape[1] < expected_width:
-            mfcc = np.pad(mfcc, ((0, 0), (0, expected_width - mfcc.shape[1])))
-        else:
-            mfcc = mfcc[:, :expected_width]
-
-        # 8. Reshape for TFLite model [1, 40, 216, 1]
-        mfcc = mfcc.astype(np.float32)
-        real_input = np.expand_dims(np.expand_dims(mfcc, axis=0), axis=-1)
-
-        # 9. Run Inference
-        interpreter.set_tensor(input_details[0]['index'], real_input)
-        interpreter.invoke()
-        output_data = interpreter.get_tensor(output_details[0]['index'])
-
-        # 10. Process Multi-class Output
-        predicted_index = int(np.argmax(output_data))
-        top_result = CATEGORIES[predicted_index]
-        top_confidence = float(output_data[0][predicted_index] * 100)
-
-        # Keep backwards compatibility with React frontend tracking "cry probability" directly
-        cry_probability = float(output_data[0][0])  # Index 0 is 'baby_cry'
-
-        print(f"Analyzed {file.filename} -> {top_result} ({top_confidence:.2f}%)")
-
-        return {
-            "success": True,
-            "filename": file.filename,
-            "ai_analysis": {
-                # Frontend relies on these two fields to plot graphs and trigger alerts
-                "cry_probability": cry_probability,
-                "is_crying": top_result == 'baby_cry',
-
-                # Extra detailed information for potential future use
-                "top_prediction": top_result,
-                "confidence": top_confidence,
-                "all_scores": {cat: float(output_data[0][i]) for i, cat in enumerate(CATEGORIES)}
-            }
-        }
-    except Exception as e:
-        print("\n=== ERROR DETAILS ===")
-        traceback.print_exc()
-        print("=====================\n")
-        raise HTTPException(status_code=500, detail="Internal Server Error. Check server console.")
-    finally:
-        # Clean up both temp files to prevent filling up the hard drive
-        if temp_webm_path and os.path.exists(temp_webm_path):
-            try:
-                os.remove(temp_webm_path)
-            except:
-                pass
-        if temp_wav_path and os.path.exists(temp_wav_path):
-            try:
-                os.remove(temp_wav_path)
-            except:
-                pass
+async def health():
+    return {"status": "Backend is running", "mic_active": True}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Start Microphone thread as a Daemon (closes when main program stops)
+    threading.Thread(target=mic_loop, daemon=True).start()
+
+    # Start FastAPI server
+    print(f"🚀 Server starting at http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
