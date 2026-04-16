@@ -278,12 +278,12 @@ if tflite and os.path.exists(MODEL_PATH):
 # --- Audio Config ---
 RATE = 22050
 CHUNK = 1024
-DURATION = 4
+DURATION = 5
 
 # --- Music Config ---
 pygame.mixer.init()
 SONG_PATH = "song.mp3"
-CRY_TIME_THRESHOLD = 4.0
+CRY_TIME_THRESHOLD = 5.0
 
 if os.path.exists(SONG_PATH):
     pygame.mixer.music.load(SONG_PATH)
